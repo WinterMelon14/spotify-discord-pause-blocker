@@ -1,50 +1,58 @@
 // ==UserScript==
-// @name         Spotify Discord Pause Blocker
-// @namespace    https://github.com/WinterMelon14/spotify-discord-pause-blocker
-// @version      1.0.0
-// @description  Auto-resumes Spotify Web Player when Discord voice activity causes unwanted pauses.
+// @name         Spotify Discord Pause Auto-Resume
+// @namespace    https://github.com/WinterMelon14/spotify-discord-pause-auto-resume
+// @version      1.1.0
+// @description  Auto-resumes Spotify Web Player when Discord/voice activity causes unwanted pauses.
 // @match        https://open.spotify.com/*
 // @run-at       document-start
 // @grant        none
-// @author       WinterMelon14
 // @license      MIT
 // ==/UserScript==
 
 (() => {
   "use strict";
 
-  const LOG_PREFIX = "[Spotify Pause Blocker]";
+  const LOG_PREFIX = "[Spotify Pause Auto-Resume]";
 
   const CONFIG = {
-    blockPauseStateRequests: true,
+    enabled: true,
 
-    // If blocking fails, just autoresume instantly!
-    autoResumeAfterPause: true,
+    // Try multiple times because Spotify’s UI/state can lag behind the media pause.
+    resumeDelaysMs: [25, 100, 250],
 
-    // How quickly to resume after an unwanted pause.
-    resumeDelaysMs: [0, 25, 75, 150, 300],
+    // Lets you manually pause without the script immediately fighting you.
+    allowRecentManualPauseIntent: true,
 
-    // If true, this allows you to pause manually from the Spotify UI without fighting the script.
-    allowRecentManualPauseButtonClick: true,
+    // Increase this if manual pausing still gets auto-resumed.
+    manualPauseGraceMs: 1500,
 
-    // Time window for considering a click on the play/pause button "manual".
-    manualClickGraceMs: 1200,
+    // Prevents rapid repeated auto-resume loops.
+    autoResumeCooldownMs: 500,
 
+    // Set true while debugging.
+    debug: false
   };
 
-  const STATE_URL_RE =
-    /^https:\/\/[a-z0-9-]+spclient\.spotify\.com\/track-playback\/v1\/devices\/[^/]+\/state$/;
-
   let lastManualPauseIntentAt = 0;
-  let lastBlockedPauseRequestAt = 0;
   let lastAutoResumeAt = 0;
 
   function log(...args) {
-    console.log(LOG_PREFIX, ...args);
+    if (CONFIG.debug) {
+      console.log(LOG_PREFIX, ...args);
+    }
   }
 
   function warn(...args) {
     console.warn(LOG_PREFIX, ...args);
+  }
+
+  function markManualIntent(reason, details = {}) {
+    lastManualPauseIntentAt = Date.now();
+    log("Manual playback intent detected:", reason, details);
+  }
+
+  function recentlyManualPauseIntent() {
+    return Date.now() - lastManualPauseIntentAt < CONFIG.manualPauseGraceMs;
   }
 
   function isSpotifyPlayPauseButton(el) {
@@ -53,7 +61,7 @@
     const button = el.closest?.("button");
     if (!button) return false;
 
-    const label = [
+    const text = [
       button.getAttribute("aria-label"),
       button.getAttribute("title"),
       button.dataset?.testid
@@ -63,76 +71,97 @@
       .toLowerCase();
 
     return (
-      label.includes("pause") ||
-      label.includes("play") ||
-      label.includes("playpause") ||
-      label.includes("control-button-playpause")
+      text.includes("play") ||
+      text.includes("pause") ||
+      text.includes("playpause") ||
+      text.includes("control-button-playpause")
     );
   }
 
+  /**
+   * Detect normal mouse/touch clicks on Spotify's own play/pause button.
+   */
   document.addEventListener(
     "pointerdown",
     event => {
       if (isSpotifyPlayPauseButton(event.target)) {
-        lastManualPauseIntentAt = Date.now();
-        log("Manual play/pause button interaction detected");
+        markManualIntent("spotify play/pause button", {
+          target: event.target
+        });
       }
     },
     true
   );
 
+  /**
+   * Detect keyboard playback-ish input when the browser exposes it to the page.
+   * Some hardware media keys will NOT appear here, hence the Media Session patch below.
+   */
   document.addEventListener(
     "keydown",
     event => {
-      // Space often toggles playback when Spotify has focus.
-      if (event.code === "Space" || event.key === " ") {
-        lastManualPauseIntentAt = Date.now();
-        log("Possible manual keyboard playback toggle detected");
+      const manualKeys = new Set([
+        "Space",
+        "MediaPlayPause",
+        "MediaPause",
+        "MediaPlay"
+      ]);
+
+      if (
+        manualKeys.has(event.code) ||
+        manualKeys.has(event.key) ||
+        event.key === " "
+      ) {
+        markManualIntent("keyboard/media key", {
+          key: event.key,
+          code: event.code
+        });
       }
     },
     true
   );
 
-  function parseJsonBody(body) {
-    if (typeof body !== "string") return null;
+  /**
+   * Detect hardware media keys routed through the Media Session API.
+   *
+   * Many keyboards' play/pause buttons do not fire regular keydown events
+   * inside the Spotify tab. Instead, the browser calls Spotify's registered
+   * media session action handlers. We wrap those handlers and mark that as
+   * manual intent before Spotify pauses.
+   */
+  if (navigator.mediaSession?.setActionHandler) {
+    const originalSetActionHandler =
+      navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
 
-    try {
-      return JSON.parse(body);
-    } catch {
-      return null;
-    }
+    navigator.mediaSession.setActionHandler = function patchedSetActionHandler(
+      action,
+      handler
+    ) {
+      const wrappedHandler = handler
+        ? function wrappedMediaSessionHandler(details) {
+            if (
+              action === "pause" ||
+              action === "play" ||
+              action === "playpause" ||
+              action === "stop"
+            ) {
+              markManualIntent("media session action", {
+                action,
+                details
+              });
+            }
+
+            return handler.apply(this, arguments);
+          }
+        : handler;
+
+      return originalSetActionHandler(action, wrappedHandler);
+    };
+
+    log("Media Session action handler patched");
   }
 
-  function isPausePayload(json) {
-    return (
-      json?.debug_source === "pause" &&
-      json?.state_ref?.paused === true &&
-      json?.sub_state?.playback_speed === 0
-    );
-  }
-
-  function makeFakeOkResponse() {
-    return new Response(
-      JSON.stringify({
-        blocked: true,
-        by: "Spotify Pause Blocker",
-        at: new Date().toISOString()
-      }),
-      {
-        status: 200,
-        statusText: "OK",
-        headers: {
-          "content-type": "application/json"
-        }
-      }
-    );
-  }
-
-  function recentlyManualPauseIntent() {
-    return Date.now() - lastManualPauseIntentAt < CONFIG.manualClickGraceMs;
-  }
-
-  function findSpotifyAudioElements() {
+  function findMediaElements() {
     return [...document.querySelectorAll("audio, video")];
   }
 
@@ -144,143 +173,106 @@
     );
   }
 
+  function attemptResume(reason, delay) {
+    const mediaElements = findMediaElements();
+
+    for (const el of mediaElements) {
+      if (el.paused) {
+        log(`Trying media.play() after ${delay}ms`, {
+          reason,
+          currentTime: el.currentTime,
+          readyState: el.readyState
+        });
+
+        el.play().catch(err => {
+          log("media.play() failed:", err);
+        });
+      }
+    }
+
+    const playButton = findPlayButton();
+
+    if (playButton) {
+      const label = playButton.getAttribute("aria-label") || "";
+
+      // Only click if Spotify currently exposes this as a Play button.
+      // This avoids accidentally clicking Pause after playback already resumed.
+      if (label.toLowerCase().includes("play")) {
+        log(`Clicking Spotify play button after ${delay}ms`, {
+          reason
+        });
+
+        playButton.click();
+      }
+    }
+  }
+
   function scheduleAutoResume(reason) {
-    if (!CONFIG.autoResumeAfterPause) return;
+    if (!CONFIG.enabled) return;
 
     if (
-      CONFIG.allowRecentManualPauseButtonClick &&
+      CONFIG.allowRecentManualPauseIntent &&
       recentlyManualPauseIntent()
     ) {
-      log("Not auto-resuming because recent manual pause/play intent was detected");
+      log("Skipping auto-resume because pause looks manual", {
+        reason
+      });
       return;
     }
 
     const now = Date.now();
 
-    // Avoid spam loops.
-    if (now - lastAutoResumeAt < 500) {
-      log("Skipping auto-resume because one just happened");
+    if (now - lastAutoResumeAt < CONFIG.autoResumeCooldownMs) {
+      log("Skipping auto-resume because one just happened", {
+        reason
+      });
       return;
     }
 
     lastAutoResumeAt = now;
 
-    warn("Scheduling auto-resume:", reason);
+    warn("Auto-resuming after unwanted pause:", reason);
 
     for (const delay of CONFIG.resumeDelaysMs) {
       setTimeout(() => {
-        const mediaEls = findSpotifyAudioElements();
-
-        for (const el of mediaEls) {
-          if (el.paused) {
-            warn(`Attempting media.play() after ${delay}ms`, {
-              reason,
-              src: el.currentSrc || el.src,
-              currentTime: el.currentTime,
-              paused: el.paused,
-              readyState: el.readyState
-            });
-
-            el.play().catch(err => {
-              warn("media.play() failed:", err);
-            });
-          }
+        if (
+          CONFIG.allowRecentManualPauseIntent &&
+          recentlyManualPauseIntent()
+        ) {
+          log("Skipping delayed resume because manual intent appeared", {
+            reason,
+            delay
+          });
+          return;
         }
 
-        const playButton = findPlayButton();
-
-        if (playButton) {
-          const label = playButton.getAttribute("aria-label");
-          if (label && label.toLowerCase().includes("play")) {
-            warn(`Clicking Spotify play button after ${delay}ms`);
-            playButton.click();
-          }
-        } else {
-          log("No play button found during auto-resume attempt");
-        }
+        attemptResume(reason, delay);
       }, delay);
     }
   }
 
   /**
-   * Patch network pause-state sync.
-   */
-  const originalFetch = window.fetch;
-
-  window.fetch = function patchedFetch(input, init = {}) {
-    let url = "";
-    let method = "GET";
-    let body = init?.body;
-
-    try {
-      if (typeof input === "string" || input instanceof URL) {
-        url = String(input);
-        method = init?.method || "GET";
-      } else if (input instanceof Request) {
-        url = input.url;
-        method = init?.method || input.method || "GET";
-        body = init?.body ?? null;
-      } else {
-        url = String(input);
-        method = init?.method || "GET";
-      }
-
-      const json = parseJsonBody(body);
-
-      const isTargetRequest =
-        method.toUpperCase() === "PUT" &&
-        STATE_URL_RE.test(url);
-
-      const isPauseRequest = isPausePayload(json);
-
-
-      if (
-        CONFIG.blockPauseStateRequests &&
-        isTargetRequest &&
-        isPauseRequest
-      ) {
-        lastBlockedPauseRequestAt = Date.now();
-
-        warn("BLOCKED Spotify pause state request", {
-          url,
-          json
-        });
-
-        scheduleAutoResume("blocked pause state request");
-
-        return Promise.resolve(makeFakeOkResponse());
-      }
-    } catch (err) {
-      console.error(LOG_PREFIX, "Fetch patch error; allowing original request:", err);
-    }
-
-    return originalFetch.apply(this, arguments);
-  };
-
-  /**
-   * Patch actual local media pause.
+   * Patch local media pause.
+   *
+   * This is the part that actually handles the Discord-triggered pause.
+   * Spotify has already paused locally by the time its network state request
+   * fires, so intercepting fetch alone is too late.
    */
   const originalPause = HTMLMediaElement.prototype.pause;
   const originalPlay = HTMLMediaElement.prototype.play;
 
-  HTMLMediaElement.prototype.pause = function patchedMediaPause() {
-    const el = this;
+  HTMLMediaElement.prototype.pause = function patchedPause() {
     const result = originalPause.apply(this, arguments);
 
-    if (
-      CONFIG.autoResumeAfterPause &&
-      !recentlyManualPauseIntent()
-    ) {
-      scheduleAutoResume("HTMLMediaElement.pause()");
-    }
+    scheduleAutoResume("HTMLMediaElement.pause()");
 
     return result;
   };
 
-  HTMLMediaElement.prototype.play = function patchedMediaPlay() {
-
+  HTMLMediaElement.prototype.play = function patchedPlay() {
+    log("HTMLMediaElement.play() called");
     return originalPlay.apply(this, arguments);
   };
 
-  log("Installed local resume patch");
+  console.log(`${LOG_PREFIX} Installed`);
 })();
