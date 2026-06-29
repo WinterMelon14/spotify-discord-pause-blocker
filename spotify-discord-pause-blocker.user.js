@@ -6,6 +6,7 @@
 // @match        https://open.spotify.com/*
 // @run-at       document-start
 // @grant        none
+// @author       WinterMelon14
 // @license      MIT
 // ==/UserScript==
 
